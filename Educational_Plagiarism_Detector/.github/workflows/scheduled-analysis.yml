@@ -1,0 +1,796 @@
+name: 🕐 Scheduled Plagiarism Analysis
+
+on:
+  schedule:
+    # Запускается каждый день в 6:00 по UTC (9:00 по Москве)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      analysis_type:
+        description: 'Тип анализа'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - 'quick'
+          - 'full'
+          - 'deep'
+      threshold:
+        description: 'Порог плагиата (0.0-1.0)'
+        required: false
+        default: '0.7'
+      notify_slack:
+        description: 'Отправить уведомление в Slack'
+        required: false
+        default: false
+        type: boolean
+      generate_report:
+        description: 'Сгенерировать PDF отчет'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  setup-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.run_id.outputs.value }}
+      timestamp: ${{ steps.timestamp.outputs.value }}
+    steps:
+      - name: Generate unique ID
+        id: run_id
+        run: echo "value=${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_OUTPUT
+      
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "value=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
+      
+      - name: Print analysis info
+        run: |
+          echo "🔍 Запускаю запланированный анализ плагиата"
+          echo "   ID анализа: ${{ steps.run_id.outputs.value }}"
+          echo "   Время: ${{ steps.timestamp.outputs.value }}"
+          echo "   Тип: ${{ github.event.inputs.analysis_type || 'full' }}"
+          echo "   Порог: ${{ github.event.inputs.threshold || '0.7' }}"
+
+  check-new-submissions:
+    runs-on: ubuntu-latest
+    needs: setup-environment
+    outputs:
+      has_new_files: ${{ steps.check.outputs.has_new_files }}
+      file_count: ${{ steps.check.outputs.file_count }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check for new submissions
+        id: check
+        run: |
+          echo "📂 Проверяю новые студенческие работы..."
+          
+          # Создаем папку uploads если её нет
+          mkdir -p uploads
+          
+          # Проверяем есть ли новые файлы с момента последнего анализа
+          LAST_RUN=$(git log --oneline --grep="📊 Automated analysis" -1 --format="%H" 2>/dev/null || echo "")
+          
+          if [ -n "$LAST_RUN" ]; then
+            # Считаем новые файлы с момента последнего анализа
+            NEW_FILES=$(git diff --name-only $LAST_RUN HEAD -- uploads/ | grep -E '\.(txt|pdf|docx)$' | wc -l)
+          else
+            # Первый запуск - считаем все файлы
+            NEW_FILES=$(find uploads/ -type f -name "*.txt" -o -name "*.pdf" -o -name "*.docx" 2>/dev/null | wc -l)
+          fi
+          
+          echo "Найдено новых файлов: $NEW_FILES"
+          
+          if [ "$NEW_FILES" -gt 0 ]; then
+            echo "has_new_files=true" >> $GITHUB_OUTPUT
+            echo "file_count=$NEW_FILES" >> $GITHUB_OUTPUT
+            
+            # Перечисляем найденные файлы
+            echo "📄 Обнаруженные файлы:"
+            find uploads/ -type f -name "*.txt" -o -name "*.pdf" -o -name "*.docx" 2>/dev/null || echo "Нет файлов"
+          else
+            echo "has_new_files=false" >> $GITHUB_OUTPUT
+            echo "file_count=0" >> $GITHUB_OUTPUT
+            
+            # Используем примеры данных для демонстрации
+            echo "Использую примеры данных для демонстрации..."
+            mkdir -p uploads_demo
+            cp -r data/sample_essays/* uploads_demo/ 2>/dev/null || echo "Примеры данных созданы"
+          fi
+
+  run-plagiarism-analysis:
+    runs-on: ubuntu-latest
+    needs: [setup-environment, check-new-submissions]
+    if: needs.check-new-submissions.outputs.has_new_files == 'true' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install matplotlib seaborn pandas numpy
+      
+      - name: Prepare analysis environment
+        run: |
+          # Создаем структуру директорий
+          mkdir -p data/results/${{ needs.setup-environment.outputs.timestamp }}
+          mkdir -p reports
+          mkdir -p visualizations
+          
+          # Используем реальные или демо данные
+          if [ "${{ needs.check-new-submissions.outputs.has_new_files }}" = "true" ]; then
+            INPUT_DIR="uploads"
+            echo "📊 Анализирую реальные студенческие работы"
+          else
+            INPUT_DIR="uploads_demo"
+            echo "🎭 Анализирую демонстрационные данные"
+          fi
+          
+          echo "input_dir=$INPUT_DIR" >> $GITHUB_ENV
+      
+      - name: Run plagiarism detection
+        id: analysis
+        env:
+          THRESHOLD: ${{ github.event.inputs.threshold || '0.7' }}
+        run: |
+          echo "🧠 Запускаю анализ плагиата..."
+          
+          # Создаем Python скрипт для анализа
+          cat > run_analysis.py << 'EOF'
+import sys
+sys.path.append('src')
+
+from plagiarism_detector import PlagiarismDetector
+import json
+from datetime import datetime
+import os
+
+def main():
+    print("🔍 Запускаю систему обнаружения плагиата...")
+    
+    # Получаем параметры
+    input_dir = os.getenv('INPUT_DIR', 'uploads_demo')
+    threshold = float(os.getenv('THRESHOLD', '0.7'))
+    timestamp = os.getenv('TIMESTAMP', datetime.now().strftime("%Y%m%d_%H%M%S"))
+    
+    print(f"Директория: {input_dir}")
+    print(f"Порог: {threshold}")
+    print(f"Временная метка: {timestamp}")
+    
+    # Создаем детектор
+    detector = PlagiarismDetector()
+    
+    try:
+        # Запускаем анализ
+        results = detector.analyze_directory(
+            input_dir,
+            threshold=threshold,
+            algorithm='ensemble'
+        )
+        
+        # Сохраняем результаты
+        results_dir = f"data/results/{timestamp}"
+        os.makedirs(results_dir, exist_ok=True)
+        
+        results_file = f"{results_dir}/results.json"
+        results.save_json(results_file)
+        
+        print(f"✅ Анализ завершен успешно!")
+        print(f"📄 Результаты сохранены в: {results_file}")
+        
+        # Создаем краткий отчет
+        summary = {
+            "analysis_id": timestamp,
+            "documents_analyzed": results.documents_analyzed,
+            "suspicious_pairs": len(results.suspicious_pairs),
+            "high_risk": results.high_risk_pairs,
+            "medium_risk": results.medium_risk_pairs,
+            "average_similarity": results.average_similarity,
+            "threshold_used": threshold,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        summary_file = f"{results_dir}/summary.json"
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        
+        print(f"📋 Краткий отчет: {summary_file}")
+        
+        # Возвращаем путь к результатам
+        print(f"::set-output name=results_dir::{results_dir}")
+        print(f"::set-output name=results_file::{results_file}")
+        print(f"::set-output name=summary_file::{summary_file}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка при анализе: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+EOF
+          
+          # Запускаем анализ
+          python run_analysis.py
+          
+          # Сохраняем результаты для следующих шагов
+          RESULTS_DIR=$(python -c "
+import json
+import os
+timestamp = '${{ needs.setup-environment.outputs.timestamp }}'
+print(f'data/results/{timestamp}')
+          ")
+          
+          echo "results_dir=$RESULTS_DIR" >> $GITHUB_OUTPUT
+      
+      - name: Generate visualizations
+        run: |
+          echo "🎨 Генерирую визуализации..."
+          
+          # Создаем скрипт для визуализаций
+          cat > create_viz.py << 'EOF'
+import sys
+sys.path.append('src')
+
+from plagiarism_detector.visualizer import ResultVisualizer, visualize_from_json
+import json
+import os
+from datetime import datetime
+
+def main():
+    timestamp = '${{ needs.setup-environment.outputs.timestamp }}'
+    results_dir = f'data/results/{timestamp}'
+    results_file = f'{results_dir}/results.json'
+    
+    print(f"📊 Загружаю результаты из: {results_file}")
+    
+    try:
+        with open(results_file, 'r', encoding='utf-8') as f:
+            results_data = json.load(f)
+        
+        # Создаем визуализатор
+        visualizer = ResultVisualizer()
+        
+        # Создаем тепловую карту
+        heatmap_path = f'{results_dir}/heatmap.png'
+        visualizer.create_heatmap(results_data, heatmap_path)
+        
+        # Создаем сводную диаграмму
+        summary_path = f'{results_dir}/summary_chart.png'
+        visualizer.create_summary_chart(results_data, summary_path)
+        
+        print(f"✅ Визуализации созданы:")
+        print(f"   📈 Тепловая карта: {heatmap_path}")
+        print(f"   📊 Сводная диаграмма: {summary_path}")
+        
+        # Создаем HTML отчет
+        html_report = f'''<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчет об анализе плагиата - {timestamp}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; }}
+        .header {{ background: #4CAF50; color: white; padding: 20px; border-radius: 10px; }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
+        .stat-card {{ background: #f5f5f5; padding: 20px; border-radius: 10px; text-align: center; }}
+        .stat-value {{ font-size: 2em; font-weight: bold; color: #4CAF50; }}
+        .images {{ display: flex; flex-direction: column; gap: 20px; margin: 20px 0; }}
+        .image-container {{ text-align: center; }}
+        img {{ max-width: 100%; border: 1px solid #ddd; border-radius: 10px; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+        th {{ background: #4CAF50; color: white; }}
+        .high-risk {{ color: #e74c3c; font-weight: bold; }}
+        .medium-risk {{ color: #f39c12; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 Отчет об анализе плагиата</h1>
+        <p>Временная метка: {timestamp}</p>
+        <p>Порог схожести: {results_data.get("average_similarity", 0):.1%}</p>
+    </div>
+    
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-value">{results_data.get("documents_analyzed", 0)}</div>
+            <div>Документов проанализировано</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{results_data.get("suspicious_pairs", []) | length}</div>
+            <div>Подозрительных пар</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{results_data.get("high_risk_pairs", 0)}</div>
+            <div>Высокий риск</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{results_data.get("medium_risk_pairs", 0)}</div>
+            <div>Средний риск</div>
+        </div>
+    </div>
+    
+    <div class="images">
+        <div class="image-container">
+            <h3>Тепловая карта схожести</h3>
+            <img src="heatmap.png" alt="Тепловая карта">
+        </div>
+        <div class="image-container">
+            <h3>Распределение по уровням риска</h3>
+            <img src="summary_chart.png" alt="Сводная диаграмма">
+        </div>
+    </div>
+    
+    <h3>Подозрительные пары документов</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Документ A</th>
+                <th>Документ B</th>
+                <th>Схожесть</th>
+                <th>Уровень риска</th>
+            </tr>
+        </thead>
+        <tbody>
+'''
+        
+        # Добавляем строки с подозрительными парами
+        suspicious_pairs = results_data.get("suspicious_pairs", [])
+        for pair in suspicious_pairs[:10]:  # Ограничиваем 10 парами
+            similarity = pair.get("similarity", 0)
+            if similarity > 0.8:
+                risk_class = "high-risk"
+                risk_text = "🔴 Высокий"
+            elif similarity > 0.5:
+                risk_class = "medium-risk"
+                risk_text = "🟡 Средний"
+            else:
+                risk_class = ""
+                risk_text = "🟢 Низкий"
+            
+            html_report += f'''
+            <tr>
+                <td>{pair.get("document_a", "")}</td>
+                <td>{pair.get("document_b", "")}</td>
+                <td class="{risk_class}">{similarity:.1%}</td>
+                <td>{risk_text}</td>
+            </tr>
+'''
+        
+        html_report += f'''
+        </tbody>
+    </table>
+    
+    <div style="margin-top: 40px; padding: 20px; background: #f5f5f5; border-radius: 10px;">
+        <p><strong>Сгенерировано автоматически:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+        <p><strong>Workflow ID:</strong> ${{{{ github.run_id }}}}</p>
+    </div>
+</body>
+</html>'''
+        
+        # Сохраняем HTML отчет
+        html_path = f'{results_dir}/report.html'
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_report)
+        
+        print(f"📄 HTML отчет создан: {html_path}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка при создании визуализаций: {e}")
+
+if __name__ == "__main__":
+    main()
+EOF
+          
+          # Запускаем создание визуализаций
+          python create_viz.py
+      
+      - name: Archive analyzed files
+        run: |
+          echo "📦 Архивирую проанализированные файлы..."
+          
+          ARCHIVE_DIR="data/archived/${{ needs.setup-environment.outputs.timestamp }}"
+          mkdir -p "$ARCHIVE_DIR"
+          
+          # Перемещаем файлы в архив
+          if [ -d "uploads" ] && [ "$(ls -A uploads 2>/dev/null)" ]; then
+            mv uploads/* "$ARCHIVE_DIR/" 2>/dev/null || echo "Нет файлов для архивации"
+            echo "✅ Файлы заархивированы в: $ARCHIVE_DIR"
+          else
+            echo "ℹ️ Нет файлов для архивации"
+          fi
+
+  generate-reports:
+    runs-on: ubuntu-latest
+    needs: [setup-environment, run-plagiarism-analysis]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Generate PDF report
+        if: ${{ github.event.inputs.generate_report != false }}
+        run: |
+          echo "📄 Генерирую PDF отчет..."
+          
+          # Устанавливаем wkhtmltopdf для генерации PDF
+          sudo apt-get update
+          sudo apt-get install -y wkhtmltopdf
+          
+          RESULTS_DIR="${{ needs.run-plagiarism-analysis.outputs.results_dir || 'data/results/' }}${{ needs.setup-environment.outputs.timestamp }}"
+          
+          if [ -f "$RESULTS_DIR/report.html" ]; then
+            wkhtmltopdf "$RESULTS_DIR/report.html" "$RESULTS_DIR/report.pdf"
+            echo "✅ PDF отчет создан: $RESULTS_DIR/report.pdf"
+          else
+            echo "ℹ️ HTML отчет не найден, пропускаю создание PDF"
+          fi
+      
+      - name: Create summary markdown
+        run: |
+          echo "📋 Создаю краткий отчет в Markdown..."
+          
+          TIMESTAMP="${{ needs.setup-environment.outputs.timestamp }}"
+          SUMMARY_FILE="data/results/$TIMESTAMP/summary.json"
+          
+          if [ -f "$SUMMARY_FILE" ]; then
+            # Читаем данные из summary.json
+            DOCS_COUNT=$(python -c "import json; data=json.load(open('$SUMMARY_FILE')); print(data.get('documents_analyzed', 0))")
+            SUSPICIOUS=$(python -c "import json; data=json.load(open('$SUMMARY_FILE')); print(data.get('suspicious_pairs', 0))")
+            HIGH_RISK=$(python -c "import json; data=json.load(open('$SUMMARY_FILE')); print(data.get('high_risk', 0))")
+            AVG_SIM=$(python -c "import json; data=json.load(open('$SUMMARY_FILE')); print(data.get('average_similarity', 0))")
+            
+            # Создаем Markdown отчет
+            cat > "data/results/$TIMESTAMP/README.md" << EOF
+# 📊 Отчет об анализе плагиата
+
+**Время анализа:** $TIMESTAMP  
+**ID запуска:** ${{ github.run_id }}
+
+## Статистика анализа
+
+| Метрика | Значение |
+|---------|----------|
+| 📄 Документов проанализировано | $DOCS_COUNT |
+| ⚠️ Подозрительных пар | $SUSPICIOUS |
+| 🔴 Высокий риск (>80%) | $HIGH_RISK |
+| 📈 Средняя схожесть | $(python -c "print('{:.1%}'.format($AVG_SIM))") |
+
+## Файлы отчета
+
+- [results.json](results.json) - Полные результаты анализа
+- [summary.json](summary.json) - Краткая статистика
+- [report.html](report.html) - HTML отчет с визуализациями
+- [heatmap.png](heatmap.png) - Тепловая карта схожести
+- [summary_chart.png](summary_chart.png) - Диаграмма распределения рисков
+
+## Следующие действия
+
+1. Проверить документы с высоким риском плагиата
+2. Уведомить преподавателей о подозрительных работах
+3. Архивировать исходные файлы
+
+---
+*Сгенерировано автоматически GitHub Actions*
+EOF
+            
+            echo "✅ Markdown отчет создан"
+          fi
+
+  commit-and-deploy:
+    runs-on: ubuntu-latest
+    needs: [setup-environment, run-plagiarism-analysis, generate-reports]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Commit analysis results
+        run: |
+          echo "💾 Коммичу результаты анализа..."
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Добавляем результаты
+          git add data/results/
+          git add data/archived/
+          
+          # Коммитим
+          TIMESTAMP="${{ needs.setup-environment.outputs.timestamp }}"
+          git commit -m "📊 Automated analysis results $TIMESTAMP
+
+- Проанализировано документов: $(find data/results/$TIMESTAMP -name '*.json' -exec python -c \"import json,sys; d=json.load(open(sys.argv[1])); print(d.get('documents_analyzed', 0))\" {} \; 2>/dev/null | head -1)
+- Обнаружено подозрительных пар: $(find data/results/$TIMESTAMP -name '*.json' -exec python -c \"import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get('suspicious_pairs', [])))\" {} \; 2>/dev/null | head -1)
+- Workflow ID: ${{ github.run_id }}" || echo "Нет изменений для коммита"
+          
+          # Пушим
+          git push
+      
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: data/results/${{ needs.setup-environment.outputs.timestamp }}
+          destination_dir: reports/${{ needs.setup-environment.outputs.timestamp }}
+          keep_files: false
+      
+      - name: Create Pull Request with findings
+        if: ${{ needs.run-plagiarism-analysis.outputs.has_new_files == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔍 Проверяю наличие высокого уровня плагиата..."
+          
+          SUMMARY_FILE="data/results/${{ needs.setup-environment.outputs.timestamp }}/summary.json"
+          
+          if [ -f "$SUMMARY_FILE" ]; then
+            HIGH_RISK=$(python -c "
+import json
+with open('$SUMMARY_FILE') as f:
+    data = json.load(f)
+    high_risk = data.get('high_risk', 0)
+    if high_risk > 0:
+        print('true')
+    else:
+        print('false')
+            ")
+            
+            if [ "$HIGH_RISK" = "true" ]; then
+              echo "⚠️ Обнаружен высокий уровень плагиата, создаю Pull Request для ревью..."
+              
+              # Создаем новую ветку
+              BRANCH_NAME="plagiarism-review-${{ needs.setup-environment.outputs.timestamp }}"
+              git checkout -b "$BRANCH_NAME"
+              
+              # Создаем файл для ревью
+              cat > "REVIEW_NEEDED.md" << EOF
+# 📋 Требуется ревью: Обнаружен плагиат
+
+## Детали анализа
+- **Время:** ${{ needs.setup-environment.outputs.timestamp }}
+- **Документов:** $(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print(d.get('documents_analyzed', 0))")
+- **Высокий риск:** $(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print(d.get('high_risk', 0))")
+- **Средний риск:** $(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print(d.get('medium_risk', 0))")
+
+## Подозрительные пары
+$(python -c "
+import json
+with open('data/results/${{ needs.setup-environment.outputs.timestamp }}/results.json') as f:
+    data = json.load(f)
+    for pair in data.get('suspicious_pairs', [])[:5]:
+        if pair.get('similarity', 0) > 0.7:
+            print(f'- **{pair.get(\"document_a\")}** ↔ **{pair.get(\"document_b\")}**: {pair.get(\"similarity\", 0):.1%}")
+")
+
+## Рекомендуемые действия
+1. Проверить указанные документы вручную
+2. Связаться с авторами для объяснений
+3. Принять решение о санкциях
+4. Обновить результаты в системе
+
+## Ссылки
+- [Полный отчет](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+- [GitHub Pages](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/reports/${{ needs.setup-environment.outputs.timestamp }}/)
+
+---
+*Создано автоматически системой обнаружения плагиата*
+EOF
+              
+              git add REVIEW_NEEDED.md
+              git commit -m "📋 Добавлен файл для ревью плагиата"
+              git push origin "$BRANCH_NAME"
+              
+              # Создаем Pull Request
+              gh pr create \
+                --title "⚠️ Требуется ревью: Обнаружен плагиат (${{ needs.setup-environment.outputs.timestamp }})" \
+                --body-file REVIEW_NEEDED.md \
+                --base main \
+                --head "$BRANCH_NAME" \
+                --label "plagiarism-review" \
+                --label "automated"
+            fi
+          fi
+      
+      - name: Create GitHub Issue for manual review
+        if: ${{ needs.run-plagiarism-analysis.outputs.has_new_files == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📝 Создаю Issue для ручной проверки..."
+          
+          SUMMARY_FILE="data/results/${{ needs.setup-environment.outputs.timestamp }}/summary.json"
+          
+          if [ -f "$SUMMARY_FILE" ]; then
+            SUSPICIOUS_COUNT=$(python -c "
+import json
+with open('$SUMMARY_FILE') as f:
+    data = json.load(f)
+    print(data.get('suspicious_pairs', 0))
+            ")
+            
+            if [ "$SUSPICIOUS_COUNT" -gt 0 ]; then
+              gh issue create \
+                --title "📋 Требуется ручная проверка: $SUSPICIOUS_COUNT подозрительных пар (${{ needs.setup-environment.outputs.timestamp }})" \
+                --body "## 🔍 Обнаружены подозрительные пары документов
+
+**Время анализа:** ${{ needs.setup-environment.outputs.timestamp }}
+**Подозрительных пар:** $SUSPICIOUS_COUNT
+**Документов проанализировано:** $(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print(d.get('documents_analyzed', 0))")
+
+### 📊 Результаты
+- [Просмотреть полный отчет](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+- [Открыть на GitHub Pages](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/reports/${{ needs.setup-environment.outputs.timestamp }}/)
+
+### 🎯 Действия
+1. Проверить подозрительные пары вручную
+2. Принять решение о дальнейших действиях
+3. Закрыть issue после проверки
+
+---
+*Создано автоматически системой обнаружения плагиата*" \
+                --label "manual-review" \
+                --label "plagiarism" \
+                --assignee "${{ github.actor }}"
+            fi
+          fi
+
+  send-notifications:
+    runs-on: ubuntu-latest
+    needs: [setup-environment, run-plagiarism-analysis]
+    if: always()
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Send summary to workflow
+        run: |
+          echo "📢 Отправляю сводку по анализу..."
+          
+          TIMESTAMP="${{ needs.setup-environment.outputs.timestamp }}"
+          SUMMARY_FILE="data/results/$TIMESTAMP/summary.json"
+          
+          if [ -f "$SUMMARY_FILE" ]; then
+            DOCS=$(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print(d.get('documents_analyzed', 0))")
+            SUSPICIOUS=$(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print(d.get('suspicious_pairs', 0))")
+            HIGH_RISK=$(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print(d.get('high_risk', 0))")
+            AVG_SIM=$(python -c "import json; d=json.load(open('$SUMMARY_FILE')); print('{:.1%}'.format(d.get('average_similarity', 0)))")
+            
+            echo "## 📊 Сводка анализа плагиата" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Время:** $TIMESTAMP" >> $GITHUB_STEP_SUMMARY
+            echo "**Workflow:** [${{ github.workflow }} #${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Метрика | Значение |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|----------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 📄 Документов | $DOCS |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚠️ Подозрительных пар | $SUSPICIOUS |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔴 Высокий риск | $HIGH_RISK |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📈 Средняя схожесть | $AVG_SIM |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔗 Ссылки" >> $GITHUB_STEP_SUMMARY
+            echo "- [📊 Полный отчет](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/reports/$TIMESTAMP/)" >> $GITHUB_STEP_SUMMARY
+            echo "- [⚙️ Workflow детали](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "*Сгенерировано автоматически*" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Send Slack notification
+        if: ${{ github.event.inputs.notify_slack == true && secrets.SLACK_WEBHOOK_URL }}
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "📊 Анализ плагиата завершен",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Время:*\n${{ needs.setup-environment.outputs.timestamp }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Документов:*\n$(python -c \"import json,os; f=os.path.join('data/results', '${{ needs.setup-environment.outputs.timestamp }}', 'summary.json'); d=json.load(open(f)); print(d.get('documents_analyzed', 0))\")"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Подозрительных пар:*\n$(python -c \"import json,os; f=os.path.join('data/results', '${{ needs.setup-environment.outputs.timestamp }}', 'summary.json'); d=json.load(open(f)); print(d.get('suspicious_pairs', 0))\")"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Высокий риск:*\n$(python -c \"import json,os; f=os.path.join('data/results', '${{ needs.setup-environment.outputs.timestamp }}', 'summary.json'); d=json.load(open(f)); print(d.get('high_risk', 0))\")"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "📊 Открыть отчет",
+                        "emoji": true
+                      },
+                      "url": "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/reports/${{ needs.setup-environment.outputs.timestamp }}/"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "⚙️ Workflow",
+                        "emoji": true
+                      },
+                      "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  cleanup:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [commit-and-deploy, send-notifications]
+    
+    steps:
+      - name: Clean up temporary files
+        run: |
+          echo "🧹 Очищаю временные файлы..."
+          
+          # Удаляем демо файлы если они были созданы
+          rm -rf uploads_demo 2>/dev/null || true
+          
+          echo "✅ Очистка завершена"
+      
+      - name: Update workflow status
+        run: |
+          echo "🏁 Workflow завершен!"
+          echo "Статус: ${{ job.status }}"
+          
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Все
