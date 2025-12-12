@@ -9,6 +9,7 @@ dist/
 .venv/
 venv/
 env/
+.vscode/
 *.log
 *.png
 *.jpg
