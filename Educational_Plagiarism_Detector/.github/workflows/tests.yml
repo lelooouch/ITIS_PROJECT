@@ -1,1 +1,156 @@
+name: Scheduled Analysis
 
+on:
+  schedule:
+    # Запускается каждый день в 2:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Similarity threshold'
+        required: false
+        default: '0.7'
+        type: choice
+        options:
+          - '0.3'
+          - '0.5'
+          - '0.7'
+          - '0.9'
+      algorithm:
+        description: 'Algorithm to use'
+        required: false
+        default: 'ensemble'
+        type: choice
+        options:
+          - 'cosine'
+          - 'lcs'
+          - 'ngram'
+          - 'ensemble'
+
+permissions:
+  contents: write  # Для автоматического коммита результатов
+
+jobs:
+  analyze-uploads:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        python -m spacy download en_core_web_sm
+        python -m nltk.downloader punkt stopwords
+    
+    - name: Check for new uploads
+      id: check-uploads
+      run: |
+        if [ -d "uploads" ] && [ "$(ls -A uploads 2>/dev/null)" ]; then
+          echo "has_uploads=true" >> $GITHUB_OUTPUT
+          echo "Uploads found, proceeding with analysis..."
+        else
+          echo "has_uploads=false" >> $GITHUB_OUTPUT
+          echo "No uploads found, using sample data..."
+          # Копируем примеры данных для анализа
+          mkdir -p uploads
+          cp -r data/sample_essays/* uploads/ 2>/dev/null || true
+        fi
+    
+    - name: Run plagiarism analysis
+      id: analysis
+      run: |
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        RESULTS_DIR="data/results/$TIMESTAMP"
+        mkdir -p $RESULTS_DIR
+        
+        # Запускаем анализ
+        python -c "
+        from plagiarism_detector import PlagiarismDetector
+        import json
+        
+        detector = PlagiarismDetector()
+        results = detector.analyze_directory(
+            'uploads/',
+            threshold=float('${{ github.event.inputs.threshold || '0.7' }}'),
+            algorithm='${{ github.event.inputs.algorithm || 'ensemble' }}'
+        )
+        
+        # Сохраняем результаты
+        with open('$RESULTS_DIR/results.json', 'w') as f:
+            json.dump(results.to_dict(), f, indent=2)
+        
+        # Генерируем визуализацию
+        detector.generate_visualization(results, '$RESULTS_DIR/heatmap.png')
+        "
+        
+        echo "results_dir=$RESULTS_DIR" >> $GITHUB_OUTPUT
+        echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+    
+    - name: Generate report
+      run: |
+        python scripts/generate_report.py \
+          --input "${{ steps.analysis.outputs.results_dir }}/results.json" \
+          --output "${{ steps.analysis.outputs.results_dir }}/report.md"
+    
+    - name: Upload analysis artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: plagiarism-analysis-${{ steps.analysis.outputs.timestamp }}
+        path: |
+          ${{ steps.analysis.outputs.results_dir }}/
+        retention-days: 30
+    
+    - name: Commit and push results
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add data/results/
+        git commit -m "📊 Automated analysis results ${{ steps.analysis.outputs.timestamp }}"
+        git push
+    
+    - name: Deploy report to GitHub Pages
+      if: success()
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ${{ steps.analysis.outputs.results_dir }}
+        destination_dir: reports/${{ steps.analysis.outputs.timestamp }}
+        keep_files: false
+    
+    - name: Create summary issue
+      if: success()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Читаем результаты
+        SUMMARY=$(python -c "
+        import json
+        with open('${{ steps.analysis.outputs.results_dir }}/results.json') as f:
+            data = json.load(f)
+            suspicious = len(data.get('suspicious_pairs', []))
+            high_risk = sum(1 for p in data.get('suspicious_pairs', []) if p.get('similarity', 0) > 0.8)
+            print(f'Found {suspicious} suspicious pairs ({high_risk} high risk)')
+        ")
+        
+        gh issue create \
+          --title "📊 Analysis Results ${{ steps.analysis.outputs.timestamp }}" \
+          --body "Plagiarism analysis completed.
+
+**Summary:**
+- $SUMMARY
+- Threshold: ${{ github.event.inputs.threshold || '0.7' }}
+- Algorithm: ${{ github.event.inputs.algorithm || 'ensemble' }}
+
+Results available in artifacts and GitHub Pages." \
+          --label "analysis-report"
